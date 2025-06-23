@@ -1,0 +1,185 @@
+/*******************************************************************************
+*
+*   Binata project
+*
+*******************************************************************************
+* All software (C)
+******************************************************************************/
+
+/*******************************************************************************
+*  Includes
+******************************************************************************/
+//  include C headers
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+//  include ST headers
+#include "stm32f4xx_hal.h"
+
+
+//  include Main definitions
+#include "main.h"
+#include "usart.h"
+
+
+//  include file Header
+#include "UsartTx_Driver.h"
+#include "UsartRx_Driver.h"
+
+//  include from - Root -
+
+//  include from - PeriphDrivers -
+
+//  include from - Modules -
+
+//  include from - Tests
+
+
+
+
+/*******************************************************************************
+*  Data types
+******************************************************************************/
+/*------------------------------------------------------------------------------
+Variables structures
+------------------------------------------------------------------------------*/
+
+/* RTOS objects handles - defined in freertos.c by CubeMX */
+extern osMessageQueueId_t usartTxQueueHandle;
+extern osSemaphoreId_t usartTxDoneSemHandle;
+
+// These handles are defined in main.c by STM32CubeMX.
+extern UART_HandleTypeDef huart2;
+
+
+/* Private driver variables */
+static osMemoryPoolId_t usart_mpool_id;
+
+
+
+/*******************************************************************************
+*  Constants and Macros
+******************************************************************************/
+/*******************************************************************************
+*  Static Data Declarations
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Public Function Bodies
+******************************************************************************/
+
+
+
+
+
+
+/**
+  * @brief  Initializes the USART DMA driver module.
+  * @param  huart: Pointer to a UART_HandleTypeDef structure that contains
+  *                the configuration information for the specified UART module.
+  * @retval osStatus_t: osOK if successful, osError otherwise.
+  */
+osStatus_t usart_driver_init(void)
+{
+    // Create the memory pool for outgoing messages
+    usart_mpool_id = osMemoryPoolNew(USART_MSG_BLOCK_COUNT, sizeof(usart_msg_t), NULL);
+    if (usart_mpool_id == NULL) {
+        // Handle error: Memory pool creation failed
+        return osError;
+    }
+
+    // Acquire the semaphore initially. The sender task will pend on this,
+    // and it should only be released by the TxCpltCallback.
+    // A timeout of 0 makes this non-blocking.
+    osSemaphoreAcquire(usartTxDoneSemHandle, 0);
+
+    return osOK;
+}
+
+/**
+  * @brief  Asynchronously sends data. Allocates memory, copies data, and puts a pointer on the queue.
+  * @param  data: Pointer to the data buffer.
+  * @param  len: Length of the data.
+  * @retval osStatus_t: Status of the operation.
+  */
+osStatus_t usart_send_async(const uint8_t* data, size_t len)
+{
+    if (data == NULL || len == 0 || len > USART_MSG_PAYLOAD_SIZE)
+    {
+        return osErrorParameter;
+    }
+
+
+    // 1. Allocate a memory block from the pool. Timeout = 0 means non-blocking.
+    usart_msg_t* p_msg = (usart_msg_t*)osMemoryPoolAlloc(usart_mpool_id, 2U);
+    if (p_msg == NULL) {
+        // Failed to allocate memory. The system is likely overloaded with outgoing messages.
+        // The caller can decide how to handle this (e.g., retry, log error).
+        return osErrorResource;
+    }
+
+    // Ensure we don't overflow the buffer.
+    size_t copy_len = (len < sizeof(p_msg->buf))? len : sizeof(p_msg->buf);
+
+    // 2. Copy the user's data into the allocated block.
+    memcpy(p_msg->buf, data, copy_len);
+    p_msg->len = copy_len;
+
+    // 3. Put the POINTER to the memory block onto the message queue.
+    // The queue stores the address (p_msg), not the content.
+    osStatus_t status = osMessageQueuePut(usartTxQueueHandle, &p_msg, 0U, 0U);
+    if (status!= osOK) {
+        // Failed to put the message on the queue (it's likely full).
+        // We must free the memory block we just allocated to prevent a memory leak.
+    	status = osMemoryPoolFree(usart_mpool_id, p_msg);  // free mem block
+        return osErrorResource;
+    }
+
+    return osOK;
+}
+
+/**
+  * @brief  Function implementing the usartSendTask thread.
+  * @param  argument: Not used.
+  * @retval None
+  */
+void StartUsartSendTask(void *argument)
+{
+	usart_driver_init();
+
+    usart_msg_t *p_msg_to_send;
+    osStatus_t status;
+
+    for(;;)
+    {
+        // 1. Pend indefinitely on the message queue, waiting for a pointer to a message block.
+        // The task consumes no CPU time while blocked here.
+    	status = osMessageQueueGet(usartTxQueueHandle, &p_msg_to_send, NULL, osWaitForever);
+
+        if (status == osOK)
+        {
+            // We have received a valid pointer to a message block.
+            // 2. Initiate the DMA transfer.
+            if (HAL_UART_Transmit_DMA(&huart2, p_msg_to_send->buf, p_msg_to_send->len) == HAL_OK)
+            {
+                // 3. Wait for the DMA transfer to complete.
+                // The task will block here until the HAL_UART_TxCpltCallback gives the semaphore.
+            	osSemaphoreAcquire(usartTxDoneSemHandle, osWaitForever);
+            }
+
+            // 4. The transfer is complete (or failed to start). Free the memory block back to the pool.
+            // This is a critical step to prevent memory leaks.
+            osMemoryPoolFree(usart_mpool_id, p_msg_to_send);
+        }
+    }
+}
+

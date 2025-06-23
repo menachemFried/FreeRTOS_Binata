@@ -1,0 +1,167 @@
+/*******************************************************************************
+*
+*   Binata project
+*
+*******************************************************************************
+* All software (C)
+******************************************************************************/
+
+/*******************************************************************************
+*  Includes
+******************************************************************************/
+//  include C headers
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+//  include ST headers
+#include "stm32f4xx_hal.h"
+
+
+//  include Main definitions
+#include "main.h"
+#include "usart.h"
+
+
+//  include file Header
+#include "UsartTx_Driver.h"
+
+//  include from - Root -
+
+//  include from - PeriphDrivers -
+
+//  include from - Modules -
+
+//  include from - Tests
+
+
+
+
+/*******************************************************************************
+*  Data types
+******************************************************************************/
+/*------------------------------------------------------------------------------
+Variables structures
+------------------------------------------------------------------------------*/
+
+// Forward declaration of RTOS objects created by CubeMX
+extern osMessageQueueId_t usart_msg_queueHandle;
+extern osMemoryPoolId_t   usart_msg_poolHandle;
+extern osSemaphoreId_t    dma_complete_semHandle;
+extern osThreadId_t       usart_sender_taskHandle;
+
+// Static pointer to the UART handle, configured during initialization
+static UART_HandleTypeDef *g_huart = NULL;
+
+/*******************************************************************************
+*  Constants and Macros
+******************************************************************************/
+/*******************************************************************************
+*  Static Data Declarations
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Public Function Bodies
+******************************************************************************/
+
+
+
+
+
+
+/**
+  * @brief  Initializes the USART DMA driver module.
+  * @param  huart: Pointer to a UART_HandleTypeDef structure that contains
+  *                the configuration information for the specified UART module.
+  * @retval osStatus_t: osOK if successful, osError otherwise.
+  */
+osStatus_t usart_driver_init(UART_HandleTypeDef *huart)
+{
+    if (huart == NULL) {
+        return osErrorParameter;
+    }
+    g_huart = huart;
+    return osOK;
+}
+
+/**
+  * @brief  Asynchronously sends data. Allocates memory, copies data, and puts a pointer on the queue.
+  * @param  data: Pointer to the data buffer.
+  * @param  len: Length of the data.
+  * @retval osStatus_t: Status of the operation.
+  */
+osStatus_t usart_send_async(const uint8_t* data, size_t len)
+{
+    // 1. Allocate a memory block from the pool.
+    // We use a timeout of 0, so we don't block if the pool is empty.
+    usart_msg_t *msg_block = osMemoryPoolAlloc(usart_msg_poolHandle, 0);
+
+    if (msg_block == NULL) {
+        // Failed to allocate memory. The system is likely overloaded with outgoing messages.
+        // The caller can decide how to handle this (e.g., retry, log error).
+        return osErrorResource;
+    }
+
+    // Ensure we don't overflow the buffer.
+    size_t copy_len = (len < sizeof(msg_block->buffer))? len : sizeof(msg_block->buffer);
+
+    // 2. Copy the user's data into the allocated block.
+    memcpy(msg_block->buffer, data, copy_len);
+    msg_block->len = copy_len;
+
+    // 3. Put the POINTER to the memory block onto the message queue.
+    // The queue stores the address (msg_block), not the content.
+    osStatus_t status = osMessageQueuePut(usart_msg_queueHandle, &msg_block, 0, 0);
+
+    if (status!= osOK) {
+        // Failed to put the message on the queue (it's likely full).
+        // We must free the memory block we just allocated to prevent a memory leak.
+        osMemoryPoolFree(usart_msg_poolHandle, msg_block);
+        return osError;
+    }
+
+    return osOK;
+}
+
+/**
+  * @brief  Function implementing the usart_sender_task thread.
+  * @param  argument: Not used.
+  * @retval None
+  */
+void StartUsartSenderTask(void *argument)
+{
+    usart_msg_t *rx_msg_block_ptr;
+    osStatus_t status;
+
+    for(;;)
+    {
+        // 1. Pend indefinitely on the message queue, waiting for a pointer to a message block.
+        // The task consumes no CPU time while blocked here.
+        status = osMessageQueueGet(usart_msg_queueHandle, &rx_msg_block_ptr, NULL, osWaitForever);
+
+        if (status == osOK)
+        {
+            // We have received a valid pointer to a message block.
+            // 2. Initiate the DMA transfer.
+            if (HAL_UART_Transmit_DMA(g_huart, (uint8_t*)rx_msg_block_ptr->buffer, rx_msg_block_ptr->len) == HAL_OK)
+            {
+                // 3. Wait for the DMA transfer to complete.
+                // The task will block here until the HAL_UART_TxCpltCallback gives the semaphore.
+                osSemaphoreAcquire(dma_complete_semHandle, osWaitForever);
+            }
+
+            // 4. The transfer is complete (or failed to start). Free the memory block back to the pool.
+            // This is a critical step to prevent memory leaks.
+            osMemoryPoolFree(usart_msg_poolHandle, rx_msg_block_ptr);
+        }
+    }
+}
+

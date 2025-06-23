@@ -1,0 +1,250 @@
+/*******************************************************************************
+*
+*   Binata project
+*
+*******************************************************************************
+* All software (C)
+******************************************************************************/
+
+/*******************************************************************************
+*  Includes
+******************************************************************************/
+//  include C headers
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+//  include ST headers
+#include "stm32f4xx_hal.h"
+
+
+//  include Main definitions
+#include "main.h"
+#include "usart.h"
+
+
+//  include file Header
+#include "UsartRx_Driver.h"
+
+//  include from - Root -
+
+//  include from - PeriphDrivers -
+
+//  include from - Modules -
+
+//  include from - Tests
+
+
+
+
+
+/*================================================================================================*/
+/*                                    Private Defines and Types                                   */
+/*================================================================================================*/
+
+// The flag to be used for signaling the parser task from the ISR.
+#define PARSER_TASK_SIGNAL_FLAG    (0x0001U)
+
+/*================================================================================================*/
+/*                                  External Handle Declarations                                  */
+/*================================================================================================*/
+
+// These handles are defined in main.c by STM32CubeMX.
+// Replace 'huart2' and 'hdma_usart2_rx' with the actual handles for your project.
+extern UART_HandleTypeDef huart2;
+extern DMA_HandleTypeDef  hdma_usart2_rx;
+
+/*================================================================================================*/
+/*                                    File-Scope Static Variables                                 */
+/*================================================================================================*/
+
+// The circular buffer that the DMA will write incoming UART data into.
+// Declared as static to be local to this file.
+static uint8_t dma_rx_buffer;
+
+// The linear buffer used to assemble complete commands from potentially fragmented data chunks.
+static uint8_t cmd_assembly_buffer;
+
+// Tracks the current length of the data stored in the command assembly buffer.
+// Declared as volatile because it can be modified in the task and potentially accessed elsewhere.
+static volatile size_t cmd_assembly_len = 0;
+
+// Tracks the last position from which we read data in the DMA circular buffer.
+// This is essential for calculating the position and length of new data.
+static size_t last_dma_read_pos = 0;
+
+// Handle for the command parser RTOS task.
+// This is obtained at runtime to be used by the ISR for signaling.
+static osThreadId_t cmdParserTaskHandle = NULL;
+
+/*================================================================================================*/
+/*                                    Private Function Prototypes                                 */
+/*================================================================================================*/
+
+static void process_new_data(const uint8_t* data, size_t len);
+static void parse_and_execute_command(void);
+
+/*================================================================================================*/
+/*                                     Public Function Definitions                                */
+/*================================================================================================*/
+
+/**
+ * @brief Initializes the DMA for continuous UART reception.
+ * @note  This function starts the HAL_UARTEx_ReceiveToIdle_DMA process.
+ *        This is a "set-and-forget" operation; the DMA will run continuously
+ *        in circular mode without further intervention.
+ */
+void usart_parser_init(void)
+{
+    // Obtain the handle for the current task (the parser task).
+    // This is crucial for the ISR to know which task to signal.
+    cmdParserTaskHandle = osThreadGetId();
+    if (cmdParserTaskHandle == NULL)
+    {
+        // Handle error: Could not get task handle.
+        // This should not happen if called from within the task.
+        Error_Handler();
+    }
+
+    // Start the DMA reception. The DMA will now continuously fill dma_rx_buffer.
+    // The HAL will trigger HAL_UARTEx_RxEventCallback on IDLE, HT, and TC events.
+    HAL_StatusTypeDef status = HAL_UARTEx_ReceiveToIdle_DMA(&huart2, dma_rx_buffer, DMA_RX_BUFFER_SIZE);
+    if (status!= HAL_OK)
+    {
+        // Handle error: DMA reception could not be started.
+        Error_Handler();
+    }
+}
+
+/**
+ * @brief The entry function and main loop for the command parser RTOS task.
+ */
+void StartCmdParserTask(void *argument)
+{
+    // Initialize the USART DMA reception engine.
+    usart_parser_init();
+
+    // The main, infinite loop of the task.
+    for(;;)
+    {
+        // Wait indefinitely for a signal from the UART ISR.
+        // The task will block here, consuming zero CPU, until a flag is set.
+        osThreadFlagsWait(PARSER_TASK_SIGNAL_FLAG, osFlagsWaitAny, osWaitForever);
+
+        // Calculate the current position of the DMA write pointer in the circular buffer.
+        // The NDTR register counts down from the total buffer size.
+        // We read this volatile register only ONCE per wakeup to ensure atomicity.
+        size_t current_pos = DMA_RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart2_rx);
+
+        // If the position hasn't changed, it was a spurious wakeup. Ignore.
+        if (current_pos == last_dma_read_pos)
+        {
+            continue;
+        }
+
+        // Check if the DMA has wrapped around the buffer.
+        if (current_pos > last_dma_read_pos)
+        {
+            // Linear read: new data is in a single contiguous block.
+            size_t new_data_len = current_pos - last_dma_read_pos;
+            process_new_data(&dma_rx_buffer[last_dma_read_pos], new_data_len);
+        }
+        else
+        {
+            // Wrap-around read: new data is in two parts.
+            // Part 1: From the last read position to the end of the buffer.
+            size_t new_data_len_part1 = DMA_RX_BUFFER_SIZE - last_dma_read_pos;
+            process_new_data(&dma_rx_buffer[last_dma_read_pos], new_data_len_part1);
+
+            // Part 2: From the beginning of the buffer to the current position.
+            size_t new_data_len_part2 = current_pos;
+            process_new_data(&dma_rx_buffer, new_data_len_part2);
+        }
+
+        // Update the last read position for the next iteration.
+        last_dma_read_pos = current_pos;
+
+        // Attempt to parse and execute any complete commands now in the assembly buffer.
+        parse_and_execute_command();
+    }
+}
+
+/*================================================================================================*/
+/*                                    Private Function Definitions                                */
+/*================================================================================================*/
+
+/**
+ * @brief Appends new data to the command assembly buffer.
+ * @param data Pointer to the new data chunk.
+ * @param len  Length of the new data chunk.
+ */
+static void process_new_data(const uint8_t* data, size_t len)
+{
+    // Ensure we don't overflow the assembly buffer.
+    size_t space_available = CMD_ASSEMBLY_BUFFER_SIZE - cmd_assembly_len;
+    if (len > space_available)
+    {
+        // Handle error: Command too long or buffer overflow.
+        // For simplicity, we'll just truncate, but a real system might log an error
+        // and clear the buffer.
+        len = space_available;
+        printf("Warning: Command assembly buffer overflow. Truncating data.\r\n");
+    }
+
+    // Copy the new data chunk to the end of the assembly buffer.
+    memcpy(&cmd_assembly_buffer[cmd_assembly_len], data, len);
+    cmd_assembly_len += len;
+}
+
+/**
+ * @brief Scans the assembly buffer for newline-terminated commands, parses, and executes them.
+ */
+static void parse_and_execute_command(void)
+{
+    uint8_t* cmd_start = cmd_assembly_buffer;
+    uint8_t* cmd_end;
+
+    // Loop in case multiple commands were received in one data chunk.
+    while ((cmd_end = memchr(cmd_start, '\n', cmd_assembly_len - (cmd_start - cmd_assembly_buffer)))!= NULL)
+    {
+        // Calculate the length of the found command.
+        size_t cmd_len = cmd_end - cmd_start;
+
+        // Temporarily null-terminate the command string for safe processing by string functions.
+        *cmd_end = '\0';
+
+        // --- PARSING LOGIC ---
+        // This is where you compare the received command string and execute actions.
+        if (strcmp((char*)cmd_start, "Led fast") == 0)
+        {
+            printf("Executing: Led fast\r\n");
+            // Call function to set LED to fast blink rate.
+        }
+        else if (strcmp((char*)cmd_start, "Led slow") == 0)
+        {
+            printf("Executing: Led slow\r\n");
+            // Call function to set LED to slow blink rate.
+        }
+        else if (strcmp((char*)cmd_start, "led dimmer") == 0)
+        {
+            printf("Executing: led dimmer\r\n");
+            // Call function to set LED brightness via PWM.
+        }
+        else
+        {
+            printf("Error: Unknown command '%s'\r\n", (char*)cmd_start);
+        }
+        // --- END OF PARSING LOGIC ---
+
+        // Calculate the length of the remaining data in the buffer.
+        size_t remaining_len = cmd_assembly_len - (cmd_end - cmd_assembly_buffer + 1);
+
+        // Remove the processed command (including the newline) from the assembly buffer
+        // by shifting the remaining data to the beginning.
+        memmove(cmd_assembly_buffer, cmd_end + 1, remaining_len);
+        cmd_assembly_len = remaining_len;
+
+        // Reset cmd_start to the beginning of the buffer for the next scan.
+        cmd_start = cmd_assembly_buffer;
+    }
+}

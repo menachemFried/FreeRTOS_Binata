@@ -1,0 +1,34 @@
+
+#include "main.h"
+#include "cmsis_os.h"
+#include "UsartTx_Driver.h" // Include our driver header
+#include <stdio.h>
+#include <string.h>
+
+
+
+/**
+  * @brief  Function implementing the producerTask1 thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+void StartProducerTask1(void *argument)
+{
+  char buffer;
+  uint32_t count = 0;
+
+  for(;;)
+  {
+    // Create a message
+    snprintf(buffer, sizeof(buffer), "Hello from Producer 1! Count: %lu\r\n", count++);
+
+    // Send it using the fire-and-forget API
+    usart_send_async((uint8_t*)buffer, strlen(buffer));
+
+    // Wait for some time
+    osDelay(1000);
+  }
+}
+
+
+/*-----------------------------------------------------------*/

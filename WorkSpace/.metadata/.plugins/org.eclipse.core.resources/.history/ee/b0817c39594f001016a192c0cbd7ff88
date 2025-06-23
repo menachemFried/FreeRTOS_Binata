@@ -1,0 +1,216 @@
+/*******************************************************************************
+*
+*   Binata project
+*
+*******************************************************************************
+* All software (C)
+******************************************************************************/
+
+/*******************************************************************************
+*  Includes
+******************************************************************************/
+//  include C headers
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+//  include ST headers
+#include "stm32f4xx_hal.h"
+
+
+//  include Main definitions
+#include "main.h"
+#include "usart.h"
+
+
+//  include file Header
+#include "USART_Driver.h"
+
+//  include from - Root -
+
+//  include from - PeriphDrivers -
+
+//  include from - Modules -
+
+//  include from - Tests
+
+
+
+
+/*******************************************************************************
+*  Data types
+******************************************************************************/
+/*------------------------------------------------------------------------------
+Variables structures
+------------------------------------------------------------------------------*/
+
+
+// RX Path Objects
+osMessageQueueId_t   rx_queue_handle = {0};
+osMemoryPoolId_t     rx_mem_pool_handle = {0};
+uint8_t              rx_dma_buffer[RX_DMA_BUFFER_SIZE] = {0};
+volatile size_t      rx_last_dma_pos = 0;
+
+// TX Path Objects
+osMessageQueueId_t   tx_queue_handle = {0};
+osMemoryPoolId_t     tx_mem_pool_handle = {0};
+osSemaphoreId_t      tx_dma_semaphore_handle = {0};
+
+
+
+/*******************************************************************************
+*  Constants and Macros
+******************************************************************************/
+/*******************************************************************************
+*  Static Data Declarations
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Private Functions Prototypes
+******************************************************************************/
+
+/*******************************************************************************
+*  Public Function Bodies
+******************************************************************************/
+
+
+
+
+
+
+
+osStatus_t uart_driver_init(void) {
+
+    // --- Create RX objects ---
+    rx_mem_pool_handle = osMemoryPoolNew(RX_POOL_BLOCK_COUNT, RX_POOL_BLOCK_SIZE, NULL);
+    if (!rx_mem_pool_handle) return osError;
+
+    rx_queue_handle = osMessageQueueNew(RX_QUEUE_MSG_COUNT, sizeof(data_msg_t*), NULL);
+    if (!rx_queue_handle) return osError;
+
+    // --- Create TX objects ---
+    tx_mem_pool_handle = osMemoryPoolNew(TX_POOL_BLOCK_COUNT, TX_POOL_BLOCK_SIZE, NULL);
+    if (!tx_mem_pool_handle) return osError;
+
+    tx_queue_handle = osMessageQueueNew(TX_QUEUE_MSG_COUNT, sizeof(data_msg_t*), NULL);
+    if (!tx_queue_handle) return osError;
+
+    tx_dma_semaphore_handle = osSemaphoreNew(1, 1, NULL);
+    if (!tx_dma_semaphore_handle) return osError;
+
+
+    // --- Start hardware reception ---
+    // This is called only ONCE.
+    if (HAL_OK!= HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rx_dma_buffer, RX_DMA_BUFFER_SIZE)) {
+        return osError;
+    }
+    // Optional: Disable half-transfer interrupt if not needed, to reduce ISR noise
+    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+
+    return osOK;
+}
+
+osStatus_t uart_driver_send(const uint8_t* data, uint16_t len, uint32_t timeout) {
+    if (!data || len == 0) return osErrorParameter;
+
+    // 1. Allocate a message container from the TX memory pool
+    data_msg_t* msg = osMemoryPoolAlloc(tx_mem_pool_handle, timeout);
+    if (!msg) return osErrorResource; // Could not allocate memory
+
+    // Ensure we don't overflow the block
+    msg->len = (len > TX_POOL_BLOCK_SIZE)? TX_POOL_BLOCK_SIZE : len;
+
+    // 2. Copy user data into the allocated block
+    // The block itself is just a pointer, so we need to allocate its internal buffer
+    msg->ptr = osMemoryPoolAlloc(tx_mem_pool_handle, timeout);
+    if(!msg->ptr) {
+        osMemoryPoolFree(tx_mem_pool_handle, msg); // free the container
+        return osErrorResource;
+    }
+    memcpy(msg->ptr, data, msg->len);
+
+    // 3. Put the pointer to the message container into the TX queue
+    osStatus_t status = osMessageQueuePut(tx_queue_handle, &msg, 0, timeout);
+    if (status!= osOK) {
+        // Failed to queue, so we must free the allocated resources
+        osMemoryPoolFree(tx_mem_pool_handle, msg->ptr);
+        osMemoryPoolFree(tx_mem_pool_handle, msg);
+    }
+    return status;
+}
+
+// This is a placeholder for the application to get processed data.
+// In a real application, this might be a queue the rx_parser_task puts data into.
+osStatus_t uart_driver_receive(uint8_t** p_data_ptr, uint16_t* p_len, uint32_t timeout) {
+    data_msg_t* received_msg_ptr;
+    osStatus_t status = osMessageQueueGet(rx_queue_handle, &received_msg_ptr, NULL, timeout);
+    if (status == osOK) {
+        *p_data_ptr = received_msg_ptr->ptr;
+        *p_len = received_msg_ptr->len;
+        // The container itself is freed here, but the inner data buffer is now owned by the app
+        osMemoryPoolFree(rx_mem_pool_handle, received_msg_ptr);
+    }
+    return status;
+}
+
+void uart_driver_free_rx_buffer(void* buffer_to_free) {
+    if (buffer_to_free) {
+        osMemoryPoolFree(rx_mem_pool_handle, buffer_to_free);
+    }
+}
+
+
+
+
+
+void UsartTx_Task(void *argument) {
+    data_msg_t* msg_to_tx;
+    for (;;) {
+        // Wait for a message pointer from the queue
+        if (osOK == osMessageQueueGet(tx_queue_handle, &msg_to_tx, NULL, osWaitForever)) {
+            // Wait for the DMA to be free
+            osSemaphoreAcquire(tx_dma_semaphore_handle, osWaitForever);
+
+            // Start DMA transmission. The HAL will use msg_to_tx->ptr directly.
+            // The HAL copies this pointer to huart->pTxBuffPtr
+            HAL_UART_Transmit_DMA(&huart2, msg_to_tx->ptr, msg_to_tx->len);
+
+            // NOTE: The memory is freed in the TxCpltCallback ISR
+        }
+    }
+}
+
+
+
+
+
+
+// This task is responsible for parsing the raw DMA stream and creating logical packets
+void UsartRx_Parser_Task(void *argument) {
+    // This is a simplified example. A real implementation would have more complex
+    // logic to parse protocols, find start/end of frames, etc.
+    // For this example, we'll treat any data received between IDLE events as one packet.
+    // The logic is now inside the RxEventCallback to be more efficient.
+    // This task will now be the consumer of the processed packets.
+
+    data_msg_t* msg;
+    for (;;) {
+        // Wait for a pointer to a complete message from the RX queue
+        if (osOK == osMessageQueueGet(rx_queue_handle, &msg, NULL, osWaitForever)) {
+            // --- APPLICATION LOGIC ---
+            // At this point, 'msg->ptr' contains 'msg->len' bytes of a complete message.
+            // The application can now process it.
+            // For example, echo it back:
+            uart_driver_send(msg->ptr, msg->len, 100);
+
+            // After processing, the application MUST free the buffer.
+            osMemoryPoolFree(rx_mem_pool_handle, msg->ptr);
+            osMemoryPoolFree(rx_mem_pool_handle, msg); // Free the container
+        }
+    }
+}
+
