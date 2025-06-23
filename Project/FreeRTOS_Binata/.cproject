@@ -79,8 +79,10 @@
 								</option>
 								<option IS_BUILTIN_EMPTY="false" IS_VALUE_EMPTY="false" id="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.option.includepaths.624673635" name="Include paths (-I)" superClass="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.option.includepaths" useByScannerDiscovery="false" valueType="includePath">
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/Core/Inc&quot;"/>
-									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/PeriphDrivers/USART/Inc&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Root/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/PeriphDrivers/USART/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Middlewares/FreeRTOS-Plus-CLI/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Modules/CLI/Inc&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/BSP/Components/Common&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/BSP/STM32F4xx-Nucleo&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/CMSIS/Device/ST/STM32F4xx/Include&quot;"/>
@@ -227,8 +229,10 @@
 								</option>
 								<option IS_BUILTIN_EMPTY="false" IS_VALUE_EMPTY="false" id="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.option.includepaths.2000181380" name="Include paths (-I)" superClass="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.option.includepaths" useByScannerDiscovery="false" valueType="includePath">
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/Core/Inc&quot;"/>
-									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/PeriphDrivers/USART/Inc&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Root/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/PeriphDrivers/USART/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Middlewares/FreeRTOS-Plus-CLI/Inc&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LOC}/UserApp/Modules/CLI/Inc&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/BSP/Components/Common&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/BSP/STM32F4xx-Nucleo&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${BINATA_PROJECT_LIB}/Drivers/CMSIS/Device/ST/STM32F4xx/Include&quot;"/>

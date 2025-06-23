@@ -25,6 +25,7 @@
 
 //  include file Header
 #include "UsartRx_Driver.h"
+#include "UsartTx_Driver.h" // Needed for usart_send_async
 
 //  include from - Root -
 
@@ -37,11 +38,18 @@
 
 
 
+/* FreeRTOS-CLI include */
+#include "FreeRTOS.h"
+#include "FreeRTOSConfig.h"
+#include "FreeRTOS_CLI.h"
+
 
 /*================================================================================================*/
 /*                                    Private Defines and Types                                   */
 /*================================================================================================*/
 
+// Define a welcome message to be sent when the CLI task starts.
+#define CLI_WELCOME_MESSAGE "Welcome to Binata CLI. Type 'help' to list commands.\r\n> "
 
 
 /*================================================================================================*/
@@ -52,44 +60,54 @@
 // Replace 'huart2' and 'hdma_usart2_rx' with the actual handles for your project.
 extern UART_HandleTypeDef huart2;
 extern DMA_HandleTypeDef  hdma_usart2_rx;
-
+extern osThreadId_t cmdParserTaskHandle; // Defined in freertos.c
 
 /*================================================================================================*/
 /*                                    File-Scope Static Variables                                 */
 /*================================================================================================*/
 
+
+
 // The circular buffer that the DMA will write incoming UART data into.
-// Declared as static to be local to this file.
+// Declared as a correctly sized array as per the project requirements.
 uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE] = {0};
 
 // The linear buffer used to assemble complete commands from potentially fragmented data chunks.
+// This buffer holds the command before it's passed to the CLI processor.
 uint8_t cmd_assembly_buffer[CMD_ASSEMBLY_BUFFER_SIZE] = {0};
 
 // Tracks the current length of the data stored in the command assembly buffer.
-// Declared as volatile because it can be modified in the task and potentially accessed elsewhere.
+// Volatile as it's modified in the task and accessed by the data processing logic.
 volatile size_t cmd_assembly_len = 0;
 
 // Tracks the last position from which we read data in the DMA circular buffer.
 // This is essential for calculating the position and length of new data.
-size_t last_dma_read_pos = 0;
+static size_t last_dma_read_pos = 0;
+
+// Buffer for receiving output from the CLI command interpreter.
+// Its size is defined in FreeRTOSConfig.h.
+static char cOutputBuffer[configCOMMAND_INT_MAX_OUTPUT_SIZE] = {0};
+
 
 
 /*================================================================================================*/
 /*                                    Private Function Prototypes                                 */
 /*================================================================================================*/
 
+
 static void process_new_data(const uint8_t* data, size_t len);
-static void parse_and_execute_command(void);
+static void process_cli_commands(void);
 
 /*================================================================================================*/
 /*                                     Public Function Definitions                                */
 /*================================================================================================*/
 
+
 /**
  * @brief Initializes the DMA for continuous UART reception.
- * @note  This function starts the HAL_UARTEx_ReceiveToIdle_DMA process.
- *        This is a "set-and-forget" operation; the DMA will run continuously
- *        in circular mode without further intervention.
+ * @note This function starts the HAL_UARTEx_ReceiveToIdle_DMA process.
+ * This is a "set-and-forget" operation; the DMA will run continuously
+ * in circular mode without further intervention.
  */
 void usart_parser_init(void)
 {
@@ -105,11 +123,15 @@ void usart_parser_init(void)
 
 /**
  * @brief The entry function and main loop for the command parser RTOS task.
+ *        This task now acts as the host for the FreeRTOS+CLI command interpreter.
  */
 void StartCmdParserTask(void *argument)
 {
     // Initialize the USART DMA reception engine.
     usart_parser_init();
+
+    // Send a welcome message to the user.
+    usart_send_async((uint8_t*)CLI_WELCOME_MESSAGE, strlen(CLI_WELCOME_MESSAGE));
 
     // The main, infinite loop of the task.
     for(;;)
@@ -123,7 +145,7 @@ void StartCmdParserTask(void *argument)
         // We read this volatile register only ONCE per wakeup to ensure atomicity.
         size_t current_pos = DMA_RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart2_rx);
 
-        // If the position hasn't changed, it was a spurious wakeup. Ignore.
+        // If the position hasn't changed, it might be a spurious wakeup. Ignore.
         if (current_pos == last_dma_read_pos)
         {
             continue;
@@ -144,30 +166,33 @@ void StartCmdParserTask(void *argument)
             process_new_data(&dma_rx_buffer[last_dma_read_pos], new_data_len_part1);
 
             // Part 2: From the beginning of the buffer to the current position.
-            size_t new_data_len_part2 = current_pos;
-            process_new_data(&dma_rx_buffer, new_data_len_part2);
+            if (current_pos > 0)
+            {
+                process_new_data(dma_rx_buffer, current_pos);
+            }
         }
 
         // Update the last read position for the next iteration.
         last_dma_read_pos = current_pos;
 
         // Attempt to parse and execute any complete commands now in the assembly buffer.
-        parse_and_execute_command();
+        process_cli_commands();
     }
 }
 
 /*================================================================================================*/
-/*                                    Private Function Definitions                                */
+/* Private Function Definitions */
 /*================================================================================================*/
 
 /**
- * @brief Appends new data to the command assembly buffer.
+ * @brief Appends new data to the command assembly buffer and echoes it to the console.
  * @param data Pointer to the new data chunk.
- * @param len  Length of the new data chunk.
+ * @param len Length of the new data chunk.
  */
 static void process_new_data(const uint8_t* data, size_t len)
 {
-
+    // Echo received characters back to the terminal for user feedback.
+    usart_send_async(data, len);
 
     // Ensure we don't overflow the assembly buffer.
     size_t space_available = CMD_ASSEMBLY_BUFFER_SIZE - cmd_assembly_len;
@@ -178,7 +203,7 @@ static void process_new_data(const uint8_t* data, size_t len)
         // and clear the buffer.
         len = space_available;
 
-        char Errorbuffer[] = "Warning: Command assembly buffer overflow. Truncating data.\r\n";
+        char Errorbuffer[] = "\r\nWarning: Command assembly buffer overflow. Truncating data.\r\n> ";
         // Send it using the fire-and-forget API
         usart_send_async((uint8_t*)Errorbuffer, strlen(Errorbuffer));
     }
@@ -189,70 +214,70 @@ static void process_new_data(const uint8_t* data, size_t len)
 }
 
 /**
- * @brief Scans the assembly buffer for newline-terminated commands, parses, and executes them.
+ * @brief Scans the assembly buffer for newline-terminated commands and passes them
+ *        to the FreeRTOS+CLI processor.
  */
-static void parse_and_execute_command(void)
+static void process_cli_commands(void)
 {
-    uint8_t* cmd_start = cmd_assembly_buffer;
-    uint8_t* cmd_end;
+    uint8_t* p_cmd_start = cmd_assembly_buffer;
+    uint8_t* p_cmd_end;
 
     // Loop in case multiple commands were received in one data chunk.
-    while ((cmd_end = memchr(cmd_start, '\n', cmd_assembly_len - (cmd_start - cmd_assembly_buffer)))!= NULL)
+    // We search for '\r' as the command delimiter.
+    while ((p_cmd_end = memchr(p_cmd_start, '\r', cmd_assembly_len))!= NULL)
     {
-        // Calculate the length of the found command.
-        size_t cmd_len = cmd_end - cmd_start;
+        // Temporarily null-terminate the command string for safe processing by the CLI.
+        *p_cmd_end = '\0';
 
-        // Temporarily null-terminate the command string for safe processing by string functions.
-        *cmd_end = '\0';
+        // Send a newline to the terminal for clean formatting before the response.
+        usart_send_async((uint8_t*)"\r\n", 2);
 
-        // --- PARSING LOGIC ---
-        // This is where you compare the received command string and execute actions.
-        if (strcmp((char*)cmd_start, "Led fast") == 0)
+        BaseType_t xMoreDataToFollow;
+
+        // The command interpreter is called repeatedly until it returns pdFALSE.
+        // This is necessary to support commands that produce multi-line output.
+        do
         {
-            char Ledbuffer[] = "Executing: Led fast\r\n";
-            // Send it using the fire-and-forget API
-            usart_send_async((uint8_t*)Ledbuffer, strlen(Ledbuffer));
+            // Process the command. Output will be placed in cOutputBuffer.
+            xMoreDataToFollow = FreeRTOS_CLIProcessCommand(
+                (char*)p_cmd_start,      // The null-terminated command string.
+                cOutputBuffer,           // The buffer to receive the output.
+                configCOMMAND_INT_MAX_OUTPUT_SIZE // The size of the output buffer.
+            );
 
-            // Call function to set LED to fast blink rate.
-        }
-        else if (strcmp((char*)cmd_start, "Led slow") == 0)
+            // Send the output generated by the command, if any.
+            // The check for strlen > 0 prevents sending empty strings.
+            if (strlen(cOutputBuffer) > 0)
+            {
+                usart_send_async((uint8_t*)cOutputBuffer, strlen(cOutputBuffer));
+            }
+
+        } while (xMoreDataToFollow!= pdFALSE);
+
+        // Calculate the length of the processed command string.
+        size_t processed_cmd_len = strlen((char*)p_cmd_start);
+
+        // Calculate the total number of bytes to remove from the buffer.
+        // This includes the command itself and the '\r' delimiter.
+        size_t consumed_len = processed_cmd_len + 1;
+
+        // Check for a following '\n' (common with terminals) and consume it as well.
+        if ((p_cmd_end + 1 < cmd_assembly_buffer + cmd_assembly_len) && (*(p_cmd_end + 1) == '\n'))
         {
-            char Ledbuffer[] = "Executing: Led slow\r\n";
-            // Send it using the fire-and-forget API
-            usart_send_async((uint8_t*)Ledbuffer, strlen(Ledbuffer));
-
-            // Call function to set LED to slow blink rate.
+            consumed_len++;
         }
-        else if (strcmp((char*)cmd_start, "led dimmer") == 0)
-        {
-            char Ledbuffer[] = "Executing: led dimmer\r\n";
-            // Send it using the fire-and-forget API
-            usart_send_async((uint8_t*)Ledbuffer, strlen(Ledbuffer));
-
-            // Call function to set LED brightness via PWM.
-        }
-        else
-        {
-            char Errorbuffer[50] = {0};
-
-            // Create a message
-            snprintf(Errorbuffer, sizeof(Errorbuffer), "Error: Unknown command '%s'\r\n", (char*)cmd_start);
-
-            // Send it using the fire-and-forget API
-            usart_send_async((uint8_t*)Errorbuffer, strlen(Errorbuffer));
-
-        }
-        // --- END OF PARSING LOGIC ---
 
         // Calculate the length of the remaining data in the buffer.
-        size_t remaining_len = cmd_assembly_len - (cmd_end - cmd_assembly_buffer + 1);
+        size_t remaining_len = cmd_assembly_len - consumed_len;
 
-        // Remove the processed command (including the newline) from the assembly buffer
-        // by shifting the remaining data to the beginning.
-        memmove(cmd_assembly_buffer, cmd_end + 1, remaining_len);
+        // Remove the processed command from the assembly buffer by shifting the remaining data.
+        memmove(cmd_assembly_buffer, p_cmd_start + consumed_len, remaining_len);
         cmd_assembly_len = remaining_len;
 
-        // Reset cmd_start to the beginning of the buffer for the next scan.
-        cmd_start = cmd_assembly_buffer;
+        // Reset the start pointer to the beginning of the buffer for the next scan.
+        p_cmd_start = cmd_assembly_buffer;
+
+        // Send a new prompt to the user.
+        usart_send_async((uint8_t*)"> ", 2);
     }
 }

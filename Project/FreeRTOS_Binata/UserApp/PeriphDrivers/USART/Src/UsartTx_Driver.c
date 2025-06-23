@@ -35,7 +35,8 @@
 
 //  include from - Tests
 
-
+/* FreeRTOS-CLI include */
+#include "FreeRTOS_CLI.h"
 
 
 /*******************************************************************************
